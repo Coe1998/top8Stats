@@ -3,92 +3,80 @@ import pandas as pd
 import cloudscraper
 from io import StringIO
 
-# --- PAGE CONFIG ---
+# --- PAGE SETUP ---
 st.set_page_config(page_title="Pauper Meta-Breaker", layout="wide", page_icon="🏆")
 
-# --- STYLING ---
-st.markdown("""
-    <style>
-    .main { background-color: #f5f7f9; }
-    .stMetric { background-color: #ffffff; padding: 15px; border-radius: 10px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
-    </style>
-    """, unsafe_allow_html=True)
-
-# --- DATA ENGINE (With Caching to prevent 403 blocks) ---
-@st.cache_data(ttl=3600)
-def get_mtg_data():
-    # We tell cloudscraper to specifically impersonate a real Chrome browser
-    scraper = cloudscraper.create_scraper(
-        browser={
-            'browser': 'chrome',
-            'platform': 'windows',
-            'desktop': True
-        }
-    )
+# --- DATA ENGINE ---
+def process_html_to_df(html_text):
+    """Shared logic to clean HTML into our tournament dataframe."""
     try:
-        url = "https://mtgdecks.net/Pauper/winrates"
-        response = scraper.get(url, timeout=15)
+        tables = pd.read_html(StringIO(html_text))
+        if not tables: return None
+        df = tables[0]
         
-        if response.status_code == 403:
-            st.error("Access Forbidden (403). The site is blocking the cloud server's IP.")
-            return None
+        # 1. Clean Headers
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = ['_'.join(col).strip() for col in df.columns.values]
+        df.rename(columns={df.columns[0]: 'Deck'}, inplace=True)
+        df.columns = [c.split('_')[0] if '_' in c and c != 'Deck' else c for c in df.columns]
+        
+        # 2. Clean numeric data
+        def clean_val(v):
+            if pd.isna(v) or v == "-" or v == "": return 0.0
+            return float(str(v).split('%')[0].strip()) if isinstance(v, str) else v
             
-        if response.status_code != 200:
-            return None
-        
-        # Load and clean as before
-        df = pd.read_html(StringIO(response.text))[0]
-        # ... (keep your existing cleaning logic here) ...
+        for col in df.columns[1:]:
+            df[col] = df[col].apply(clean_val)
         return df
     except Exception as e:
-        st.error(f"Error: {e}")
+        st.error(f"Error processing data: {e}")
+        return None
+
+@st.cache_data(ttl=3600)
+def scrape_data_automatically():
+    # Use a high-fidelity browser fingerprint
+    scraper = cloudscraper.create_scraper(
+        browser={'browser': 'chrome', 'platform': 'windows', 'desktop': True}
+    )
+    try:
+        response = scraper.get("https://mtgdecks.net/Pauper/winrates", timeout=15)
+        if response.status_code == 200:
+            return process_html_to_df(response.text)
+        return None
+    except:
         return None
 
 # --- APP UI ---
-st.title("🏆 Pauper Tournament Meta-Breaker")
-st.write("Target your specific Top 8 and find the statistical winner.")
+st.title("🏆 Pauper Meta-Breaker")
 
-data = get_mtg_data()
+# Use a sidebar for data loading options
+st.sidebar.header("Data Source")
+data_mode = st.sidebar.radio("Choose how to load data:", ["Auto-Scrape", "Manual Upload"])
 
+data = None
+
+if data_mode == "Auto-Scrape":
+    data = scrape_data_automatically()
+    if data is None:
+        st.warning("⚠️ Auto-scrape blocked by Cloudflare. Please use 'Manual Upload' below.")
+
+if data_mode == "Manual Upload" or data is None:
+    st.info("To bypass blocks: Go to MTGDecks.net, right-click 'Save Page As', and upload the HTML file here.")
+    uploaded_file = st.file_uploader("Upload MTGDecks HTML file", type=['html', 'htm'])
+    if uploaded_file:
+        html_content = uploaded_file.read().decode("utf-8")
+        data = process_html_to_df(html_content)
+
+# --- ANALYSIS SECTION ---
 if data is not None:
-    # SIDEBAR: Tournament Setup
-    st.sidebar.header("Tournament Setup")
     all_decks = sorted(data['Deck'].unique().tolist())
-    
-    selected_opponents = st.sidebar.multiselect(
-        "Select your expected opponents:",
-        options=all_decks,
-        default=all_decks[:3] if len(all_decks) > 3 else None,
-        help="Add the decks you expect to face in the Top 8."
-    )
+    selected_opps = st.multiselect("Select Expected Top 8 Decks:", options=all_decks)
 
-    if selected_opponents:
-        # CALCULATION
-        data['Meta_Score'] = data[selected_opponents].mean(axis=1)
-        data['Bad_Matchups'] = (data[selected_opponents] < 45).sum(axis=1)
-        data['Win_Count'] = (data[selected_opponents] > 50).sum(axis=1)
+    if selected_opps:
+        data['Meta_Score'] = data[selected_opps].mean(axis=1)
+        data['Win_Count'] = (data[selected_opps] > 50).sum(axis=1)
         
-        results = data.sort_values(by=['Meta_Score', 'Bad_Matchups'], ascending=[False, True])
-        best_deck = results.iloc[0]
-
-        # TOP METRICS
-        col1, col2, col3 = st.columns(3)
-        with col1:
-            st.metric("Top Recommended Deck", best_deck['Deck'])
-        with col2:
-            st.metric("Avg. Win Rate", f"{best_deck['Meta_Score']:.1f}%")
-        with col3:
-            st.metric("Matchup Coverage", f"{best_deck['Win_Count']}/{len(selected_opponents)}")
-
-        # RESULTS TABLE
-        st.subheader("Detailed Matchup Analysis")
-        display_cols = ['Deck', 'Meta_Score', 'Bad_Matchups'] + selected_opponents
-        st.dataframe(
-            results[display_cols].style.background_gradient(cmap='RdYlGn', subset=selected_opponents),
-            use_container_width=True,
-            hide_index=True
-        )
-    else:
-        st.info("👈 Select at least one opponent in the sidebar to begin analysis.")
-else:
-    st.error("Could not retrieve data. The site might be down or blocking the request.")
+        results = data.sort_values(by=['Meta_Score'], ascending=False)
+        
+        st.subheader("Top Picks for this Meta")
+        st.dataframe(results[['Deck', 'Meta_Score', 'Win_Count'] + selected_opps], hide_index=True)
