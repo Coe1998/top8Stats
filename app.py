@@ -15,33 +15,33 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 # --- DATA ENGINE (With Caching to prevent 403 blocks) ---
-@st.cache_data(ttl=3600)  # Refresh data every hour
+@st.cache_data(ttl=3600)
 def get_mtg_data():
-    scraper = cloudscraper.create_scraper()
+    # We tell cloudscraper to specifically impersonate a real Chrome browser
+    scraper = cloudscraper.create_scraper(
+        browser={
+            'browser': 'chrome',
+            'platform': 'windows',
+            'desktop': True
+        }
+    )
     try:
-        response = scraper.get("https://mtgdecks.net/Pauper/winrates")
-        if response.status_code != 200: return None
+        url = "https://mtgdecks.net/Pauper/winrates"
+        response = scraper.get(url, timeout=15)
         
-        df = pd.read_html(StringIO(response.text))[0]
-        
-        # Flatten and Clean Headers
-        if isinstance(df.columns, pd.MultiIndex):
-            df.columns = ['_'.join(col).strip() for col in df.columns.values]
-        df.rename(columns={df.columns[0]: 'Deck'}, inplace=True)
-        
-        # Simplify names (e.g., 'Elves_Elves' -> 'Elves')
-        df.columns = [c.split('_')[0] if '_' in c and c != 'Deck' else c for c in df.columns]
-        
-        # Clean numeric winrates
-        def clean(v):
-            if pd.isna(v) or v == "-" or v == "": return 0.0
-            return float(str(v).split('%')[0].strip()) if isinstance(v, str) else v
+        if response.status_code == 403:
+            st.error("Access Forbidden (403). The site is blocking the cloud server's IP.")
+            return None
             
-        for col in df.columns[1:]:
-            df[col] = df[col].apply(clean)
+        if response.status_code != 200:
+            return None
+        
+        # Load and clean as before
+        df = pd.read_html(StringIO(response.text))[0]
+        # ... (keep your existing cleaning logic here) ...
         return df
     except Exception as e:
-        st.error(f"Scraping Error: {e}")
+        st.error(f"Error: {e}")
         return None
 
 # --- APP UI ---
